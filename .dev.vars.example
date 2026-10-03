@@ -1,0 +1,5 @@
+# Copy to .dev.vars for local development (wrangler dev). Never commit .dev.vars.
+TELEGRAM_BOT_TOKEN=
+GEMINI_API_KEY=
+WEBHOOK_SECRET=
+MY_TELEGRAM_ID=
