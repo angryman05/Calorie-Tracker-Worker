@@ -116,7 +116,7 @@ async function handleTelegramWebhook(request, env) {
     });
 
     const dailyData = await loadDay(env, senderId, today);
-    const meal = await askGemini(userText, env);
+    const {meal, model} = await askGemini(userText, env);
 
     dailyData.calories += num(meal.calories);
     dailyData.protein += num(meal.protein);
@@ -183,32 +183,111 @@ async function handleCommand(text, chatId, userId, today, env) {
 /* Gemini                                                              */
 /* ------------------------------------------------------------------ */
 
-async function askGemini(userText, env) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": env.GEMINI_API_KEY, // header instead of URL so it never lands in logs
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: `${SYSTEM_INSTRUCTION}\n\nUser: "${userText}"` }] }],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-    }
-  );
+// Order = preference. Check Google AI Studio for the model names currently
+// available to you and adjust this list. Lite/older models often have
+// separate (and sometimes more generous) free quotas.
+const GEMINI_MODELS = [
+  "gemini-3.6-flash",
+  "gemini-3-flash-preview",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-3.1-flash-lite",
+];
 
-  const result = await response.json();
-  if (result.error) {
-    throw new Error(`Google API: ${result.error.message}`);
+// Errors where trying another model makes sense (404 = wrong/retired model ID)
+const RETRYABLE_STATUS = new Set([404, 429, 500, 503, 504]);
+
+/** Seconds until midnight Pacific, when Gemini's daily quotas reset. */
+function secondsUntilQuotaReset() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    hour: "numeric",
+    minute: "numeric",
+    second: "numeric",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+  const get = (t) => Number(parts.find((p) => p.type === t).value);
+  const elapsed = get("hour") * 3600 + get("minute") * 60 + get("second");
+  return Math.max(60, 86400 - elapsed + 5); // KV minimum TTL is 60s
+}
+
+function cooldownSeconds(status, error) {
+  if (status === 404) return 86400; // broken ID, don't retry today
+  if (status === 429) {
+    const isDaily = JSON.stringify(error || {}).includes("PerDay");
+    return isDaily ? secondsUntilQuotaReset() : 60;
+  }
+  return 60; // 5xx overload: brief pause
+}
+
+async function askGemini(userText, env) {
+  const errors = [];
+
+  for (const model of GEMINI_MODELS) {
+    const cooldownKey = `cooldown_${model}`;
+    if (await env.CALORII_KV.get(cooldownKey)) {
+      errors.push(`${model}: în pauză`);
+      continue;
+    }
+
+    let response;
+    try {
+      response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": env.GEMINI_API_KEY,
+          },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: `${SYSTEM_INSTRUCTION}\n\nUser: "${userText}"` }] }],
+            generationConfig: { responseMimeType: "application/json" },
+          }),
+          signal: AbortSignal.timeout(15000), // don't hang on a stalled model
+        }
+      );
+    } catch (networkErr) {
+      errors.push(`${model}: ${networkErr.message}`);
+      continue;
+    }
+
+    let result = null;
+    try {
+      result = await response.json();
+    } catch {
+      /* non-JSON body, handled below */
+    }
+
+    if (response.ok && !result?.error) {
+      try {
+        let raw = result.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        raw = raw.replace(/^```json/im, "").replace(/```$/m, "").trim();
+        const meal = JSON.parse(raw);
+        // Must be an object with a numeric calories field, otherwise treat as a failed answer
+        if (!meal || typeof meal !== "object" || !Number.isFinite(Number(meal.calories))) {
+          throw new Error("missing calories");
+        }
+        return { meal, model };
+      } catch {
+        errors.push(`${model}: răspuns invalid`);
+        continue;
+      }
+    }
+
+    const msg = result?.error?.message || `HTTP ${response.status}`;
+
+    if (!RETRYABLE_STATUS.has(response.status)) {
+      throw new Error(`Google API (${model}): ${msg}`);
+    }
+
+    errors.push(`${model}: ${msg}`);
+    await env.CALORII_KV.put(cooldownKey, "1", {
+      expirationTtl: cooldownSeconds(response.status, result?.error),
+    });
   }
 
-  // Strip markdown code fences in case the model adds them despite JSON mode.
-  let raw = result.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-  raw = raw.replace(/^```json/im, "").replace(/```$/m, "").trim();
-
-  return JSON.parse(raw);
+  throw new Error(`Toate modelele sunt indisponibile:\n${errors.join("\n")}`);
 }
 
 /* ------------------------------------------------------------------ */
